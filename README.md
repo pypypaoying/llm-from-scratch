@@ -23,7 +23,7 @@
 W1 (09.29–10.05)  micrograd + makemore 1–5   → 见 01_micrograd / 02_makemore
 W2 (10.06–10.12)  WaveNet + 从零手写 GPT      → 见 02_makemore / 03_nanoGPT
 W3 (10.13–10.19)  复现 nanoGPT + 训练工程     → 见 03_nanoGPT
-W4 (10.20–10.31)  巩固 + 博客 + 面试手撕模板  → 见 04_interview_handwrite / blog
+W4 (10.20–10.31)  巩固 + 输出（博客 / 面试手撕模板，完成时再建对应目录）
 ```
 
 ## 目录结构
@@ -33,10 +33,9 @@ W4 (10.20–10.31)  巩固 + 博客 + 面试手撕模板  → 见 04_interview_h
 | `01_micrograd/` | 手写自动求导引擎（Value 类 + 拓扑排序 backward） | Day 1 / W1 |
 | `02_makemore/` | bigram → MLP → BatchNorm → WaveNet，含手推反向传播对拍 | Day 2–5 / W1–W2 |
 | `03_nanoGPT/` | 从零手写 Transformer / GPT，TinyStories 训练与生成 | Day 6 / W2–W3 |
-| `04_interview_handwrite/` | 面试手撕模板：MHA、LayerNorm/RMSNorm、BPE、top-k sampling | W4 |
-| `notes/` | 每周周记与概念笔记（拓扑排序、Pre-LN vs Post-LN 等） | 全程 |
-| `blog/` | 对外发布的技术博客草稿 | W4 |
 | `data/` | 数据集存放（已 gitignore，不上传） | — |
+
+> 笔记、博客、面试手撕模板等目录，等对应阶段真正产出内容时再补，避免空占位。
 
 ## 进度清单（Day 1–7 验收）
 
