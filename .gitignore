@@ -1,0 +1,67 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+ENV/
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ===== 实验跟踪 / 日志 =====
+wandb/
+runs/
+logs/
+*.log
+mlruns/
+
+# ===== 模型权重 / checkpoint（大文件，不进 Git）=====
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+checkpoints/
+out/
+*.onnx
+
+# ===== 数据集（用 data/ 目录，统一忽略，按需另存）=====
+data/*
+!data/.gitkeep
+!data/README.md
+
+# ===== 系统 / 编辑器 =====
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# ===== 环境变量 / 密钥（切勿上传 API key）=====
+.env
+.env.*
+*.key
+secrets.*
