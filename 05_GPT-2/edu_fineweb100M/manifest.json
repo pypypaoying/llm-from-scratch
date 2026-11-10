@@ -1,0 +1,28 @@
+{
+  "dataset": "HuggingFaceFW/fineweb-edu",
+  "subset": "sample-10BT",
+  "source_url": "https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu/resolve/main/sample/10BT/000_00000.parquet",
+  "tokenizer": "gpt2",
+  "license": "odc-by",
+  "split_method": "validation documents first; training starts at the next document",
+  "splits": {
+    "val": {
+      "file": "val.npy",
+      "stored_tokens": 1000001,
+      "prediction_tokens": 1000000,
+      "documents": 970,
+      "first_document_id": "<urn:uuid:0d8a309d-25c5-405d-a08a-c11239f0d717>",
+      "last_document_id": "<urn:uuid:99396f1c-2adc-4078-a560-0f70b1015a6e>",
+      "sha256": "137f5e9c17252aa166f847ad806fa51465779e7bcfaf561553fb137e191f530b"
+    },
+    "train": {
+      "file": "train.npy",
+      "stored_tokens": 100000001,
+      "prediction_tokens": 100000000,
+      "documents": 95804,
+      "first_document_id": "<urn:uuid:91ee02b2-e00e-46af-bc3e-fcfaef6b5003>",
+      "last_document_id": "<urn:uuid:8ba40b68-9073-4957-bf91-a419cf4c987c>",
+      "sha256": "17f91930ceafd787401d24d509cffa100fe2aa9e381ba729c5171d6aaf0d9972"
+    }
+  }
+}

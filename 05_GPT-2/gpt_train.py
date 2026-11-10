@@ -1,8 +1,16 @@
 import math
-from dataclasses import dataclass
+import argparse
+import hashlib
+import json
+import os
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import inspect
 
 # -----------------------------------------------------------------------------
 
@@ -77,7 +85,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024 # max sequence length
-    vocab_size: int = 50304 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+    vocab_size: int = 50304 # 50257 GPT-2 tokens, padded for matrix alignment
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
@@ -182,147 +190,305 @@ class GPT(nn.Module):
 
         return model
 
-#学习率余弦衰减
-max_lr = 6e-4          # 最大学习率
-min_lr = max_lr * 0.1  # 最小学习率：6e-5
-warmup_steps = 10      # 前 10 次更新逐渐增大学习率
-max_steps = 50         # 总共更新 50 次
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        param_dict = {
+            name: parameter
+            for name, parameter in self.named_parameters()
+            if parameter.requires_grad
+        }
+
+        decay_params = [
+            p for p in param_dict.values() if p.dim() >= 2
+        ]
+        nodecay_params = [
+            p for p in param_dict.values() if p.dim() < 2
+        ]
+
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
+        ]
+
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+
+        print(
+            f"num decayed parameter tensors: {len(decay_params)}, "
+            f"with {num_decay_params:,} parameters"
+        )
+        print(
+            f"num non-decayed parameter tensors: {len(nodecay_params)}, "
+            f"with {num_nodecay_params:,} parameters"
+        )
+
+        fused_available = (
+            "fused" in inspect.signature(torch.optim.AdamW).parameters
+        )
+        use_fused = fused_available and "cuda" in device
+        print(f"using fused AdamW: {use_fused}")
+
+        optimizer = torch.optim.AdamW(
+            optim_groups,
+            lr=learning_rate,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            fused=use_fused,
+        )
+        return optimizer
+
+# Single-GPU 100M-token experiment, following the course training loop.
+DATA_DIR = Path(__file__).with_name("edu_fineweb100M")
+OUT_DIR = Path(__file__).with_name("log_100M")
+TRAIN_TOKENS = 100_000_000
+total_batch_size = 524288
+B, T = 4, 1024
+max_lr, min_lr = 6e-4, 6e-5
+warmup_steps = 10
+max_steps = math.ceil(TRAIN_TOKENS / total_batch_size)
+eval_interval = 10
+eval_tokens = 131072
+use_compile = True
+
 
 def get_lr(step):
-    # 第一阶段：线性预热
     if step < warmup_steps:
         return max_lr * (step + 1) / warmup_steps
+    ratio = min(1.0, (step - warmup_steps) / max(1, max_steps - 1 - warmup_steps))
+    return min_lr + 0.5 * (1 + math.cos(math.pi * ratio)) * (max_lr - min_lr)
 
-    # 超过调度范围后，保持最小学习率
-    if step > max_steps:
-        return min_lr
-
-    # 第二阶段：余弦衰减
-    decay_ratio = (
-        (step - warmup_steps)
-        / (max_steps - warmup_steps)
-    )
-    assert 0 <= decay_ratio <= 1
-
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-
-    return min_lr + coeff * (max_lr - min_lr)
-
-# -----------------------------------------------------------------------------
-import tiktoken
 
 class DataLoaderLite:
-    def __init__(self, B, T):
-        self.B = B
-        self.T = T
-
-        # at init load tokens from disk and store them in memory
-        with open('input.txt', 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
-
-        # state
+    def __init__(self, B, T, split):
+        self.B, self.T, self.split = B, T, split
+        self.tokens = np.load(DATA_DIR / f"{split}.npy", mmap_mode="r")
+        if self.tokens.dtype != np.uint16 or len(self.tokens) < 2:
+            raise ValueError(f"Invalid {split} token file")
         self.current_position = 0
 
-    def next_batch(self):
-        B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        # advance the position in the tensor
-        self.current_position += B * T
-        # if loading the next batch would be out of bounds, reset
-        if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
-        return x, y
+    def reset(self):
+        self.current_position = 0
 
-# -----------------------------------------------------------------------------
-# attempt to autodetect the device
-import time
+    def next_batch(self, token_limit=None):
+        requested = min(self.B * self.T, token_limit or self.B * self.T)
+        rows = min(self.B, max(1, requested // self.T))
+        length = self.T if requested >= self.T else requested
+        count = rows * length
+        p = self.current_position
+        if p + count + 1 > len(self.tokens):
+            if self.split == "train":
+                raise RuntimeError("Training data exhausted before the token budget")
+            p = 0
+        # Convert only this batch to int64; keep the dataset on disk.
+        buf = torch.from_numpy(np.array(self.tokens[p:p + count + 1], dtype=np.int64))
+        self.current_position = p + count
+        return buf[:-1].view(rows, length), buf[1:].view(rows, length)
 
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print(f"using device: {device}")
 
-torch.manual_seed(1337)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
-train_loader = DataLoaderLite(B=4, T=256)
 
-torch.set_float32_matmul_precision('high')
+@torch.no_grad()
+def estimate_loss(model, loader, device, token_limit=eval_tokens):
+    was_training = model.training
+    model.eval()
+    loader.reset()
+    count, loss_sum = 0, 0.0
+    limit = min(token_limit, len(loader.tokens) - 1)
+    try:
+        while count < limit:
+            x, y = loader.next_batch(limit - count)
+            x, y = x.to(device), y.to(device)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda"):
+                _, loss = model(x, y)
+            loss_sum += loss.item() * y.numel()
+            count += y.numel()
+    finally:
+        model.train(was_training)
+    return loss_sum / count
 
-# get logits
-model = GPT(GPTConfig())
-model.to(device)
-model = torch.compile(model)
 
-# optimize!
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4 , betas = (0.9, 0.95) )
-for step in range(max_steps):
-    t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-    optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    # 本次更新使用的学习率
-    lr = get_lr(step)
-    # 将学习率写入优化器的所有参数组
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
-    optimizer.step()
-    torch.cuda.synchronize() # wait for the GPU to finish work
-    t1 = time.time()
-    dt = (t1 - t0)*1000 # time difference in miliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {step}, loss: {loss.item()}, lr: {lr:.6f}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}, norm: {norm:.2f}")
+@torch.no_grad()
+def generate(model, device, prompt="The scientist looked at the sky", new_tokens=200):
+    import tiktoken
+    enc = tiktoken.get_encoding("gpt2")
+    was_training = model.training
+    model.eval()
+    idx = torch.tensor([enc.encode(prompt)], dtype=torch.long, device=device)
+    rng = torch.Generator(device=device).manual_seed(42)
+    try:
+        for _ in range(new_tokens):
+            with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda"):
+                logits, _ = model(idx[:, -T:])
+            logits = logits[:, -1, :enc.n_vocab].float() / 0.8
+            values, indices = torch.topk(logits, 50, dim=-1)
+            choice = torch.multinomial(F.softmax(values, dim=-1), 1, generator=rng)
+            idx = torch.cat((idx, indices.gather(-1, choice)), dim=1)
+    finally:
+        model.train(was_training)
+    return enc.decode(idx[0].tolist())
 
-import sys; sys.exit(0)
 
-# prefix tokens
-model.eval()
-num_return_sequences = 5
-max_length = 30
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-x = tokens.to(device)
+def save_checkpoint(raw_model, optimizer, loader, step, tokens_seen, best_val, history, data_id, settings):
+    checkpoint = {
+        "model": raw_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "config": asdict(raw_model.config),
+        "step": step, "tokens_seen": tokens_seen,
+        "train_position": loader.current_position,
+        "best_val": best_val, "history": history,
+        "data_id": data_id, "settings": settings,
+        "cpu_rng": torch.get_rng_state(),
+        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    }
+    temporary = OUT_DIR / "last.tmp.pt"
+    torch.save(checkpoint, temporary)
+    os.replace(temporary, OUT_DIR / "last.pt")
 
-# generate! right now x is (B, T) where B = 5, T = 8
-# set the seed to 42
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    # forward the model to get the logits
-    with torch.no_grad():
-        logits = model(x) # (B, T, vocab_size)
-        # take the logits at the last position
-        logits = logits[:, -1, :] # (B, vocab_size)
-        # get the probabilities
-        probs = F.softmax(logits, dim=-1)
-        # do top-k sampling of 50 (huggingface pipeline default)
-        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # select a token from the top-k probabilities
-        # note: multinomial does not demand the input to sum to 1
-        ix = torch.multinomial(topk_probs, 1) # (B, 1)
-        # gather the corresponding indices
-        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-        # append to the sequence
-        x = torch.cat((x, xcol), dim=1)
 
-# print the generated text
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+def run(resume=False, stop_after=None):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(1337)
+    torch.set_float32_matmul_precision("high")
+    manifest_path = DATA_DIR / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError("Run fineweb.py first to prepare train/validation data")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    data_id = {}
+    for split in ("train", "val"):
+        description = manifest["splits"][split]
+        digest = file_sha256(DATA_DIR / description["file"])
+        if digest != description["sha256"]:
+            raise ValueError(f"{split} data checksum changed")
+        data_id[split] = digest
+    settings = {
+        "train_tokens": TRAIN_TOKENS, "total_batch_size": total_batch_size,
+        "B": B, "T": T, "max_lr": max_lr, "min_lr": min_lr,
+        "warmup_steps": warmup_steps, "max_steps": max_steps,
+        "eval_interval": eval_interval, "eval_tokens": eval_tokens,
+        "compile": use_compile, "precision": "bf16" if device == "cuda" else "fp32",
+        "weight_decay": 0.1, "betas": [0.9, 0.95], "grad_clip": 1.0,
+    }
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = OUT_DIR / "last.pt"
+    if checkpoint_path.exists() and not resume:
+        raise FileExistsError("A checkpoint exists; use --resume to continue it")
+    if resume and not checkpoint_path.exists():
+        raise FileNotFoundError("No last.pt checkpoint to resume")
+    train_loader = DataLoaderLite(B, T, "train")
+    val_loader = DataLoaderLite(B, T, "val")
+    if len(train_loader.tokens) - 1 < TRAIN_TOKENS:
+        raise ValueError("Not enough unique training tokens for this experiment")
+    raw_model = GPT(GPTConfig()).to(device)
+    optimizer = raw_model.configure_optimizers(0.1, max_lr, device)
+    step, tokens_seen, best_val, history = 0, 0, float("inf"), []
+    if resume:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if (checkpoint["settings"] != settings or checkpoint["data_id"] != data_id
+                or checkpoint["config"] != asdict(raw_model.config)):
+            raise ValueError("Resume requires the same experiment settings and data")
+        raw_model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        step, tokens_seen = checkpoint["step"], checkpoint["tokens_seen"]
+        train_loader.current_position = checkpoint["train_position"]
+        if train_loader.current_position != tokens_seen:
+            raise ValueError("Checkpoint data cursor and processed tokens disagree")
+        best_val, history = checkpoint["best_val"], checkpoint["history"]
+        torch.set_rng_state(checkpoint["cpu_rng"])
+        if device == "cuda":
+            torch.cuda.set_rng_state_all(checkpoint["cuda_rng"])
+        del checkpoint
+        print(f"Resumed update {step}, tokens {tokens_seen:,}", flush=True)
+    model = torch.compile(raw_model) if use_compile else raw_model
+    model.train()
+    (OUT_DIR / "config.json").write_text(json.dumps({
+        **settings, "model": asdict(raw_model.config), "data": manifest,
+        "pytorch": str(torch.__version__), "device": device,
+        "gpu": torch.cuda.get_device_name(0) if device == "cuda" else None,
+    }, indent=2) + "\n", encoding="utf-8")
+
+    if not history:
+        initial_val = estimate_loss(model, val_loader, device)
+        best_val = initial_val
+        history.append({"step": 0, "tokens": 0, "val_loss": initial_val})
+        torch.save({"model": raw_model.state_dict(), "config": asdict(raw_model.config),
+                    "step": 0, "tokens_seen": 0, "val_loss": initial_val}, OUT_DIR / "best.pt")
+        save_checkpoint(raw_model, optimizer, train_loader, 0, 0, best_val, history, data_id, settings)
+        print(f"initial validation loss: {initial_val:.6f}", flush=True)
+
+    started = time.perf_counter()
+    while tokens_seen < TRAIN_TOKENS:
+        if device == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        update_tokens = min(total_batch_size, TRAIN_TOKENS - tokens_seen)
+        optimizer.zero_grad(set_to_none=True)
+        consumed = 0
+        loss_accum = torch.zeros((), device=device)
+        while consumed < update_tokens:
+            x, y = train_loader.next_batch(update_tokens - consumed)
+            x, y = x.to(device), y.to(device)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda"):
+                _, loss = model(x, y)
+            # Weight the final short microbatch correctly as well.
+            weighted_loss = loss * (y.numel() / update_tokens)
+            loss_accum += weighted_loss.detach()
+            weighted_loss.backward()
+            consumed += y.numel()
+        norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0, error_if_nonfinite=True)
+        lr = get_lr(step)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+        optimizer.step()
+        if device == "cuda":
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+        step += 1
+        tokens_seen += consumed
+        row = {
+            "step": step, "tokens": tokens_seen, "train_loss": loss_accum.item(),
+            "lr": lr, "grad_norm": norm.item(), "seconds": elapsed,
+            "tokens_per_second": consumed / elapsed,
+        }
+        print(f"step {step:03d}/{max_steps} | tokens {tokens_seen:,}/{TRAIN_TOKENS:,} | "
+              f"loss {row['train_loss']:.4f} | lr {lr:.3e} | norm {row['grad_norm']:.2f} | "
+              f"{elapsed:.2f}s | {row['tokens_per_second']:.0f} tok/s", flush=True)
+        with open(OUT_DIR / "train.jsonl", "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row) + "\n")
+        if step % eval_interval == 0 or tokens_seen == TRAIN_TOKENS or step == stop_after:
+            val_loss = estimate_loss(model, val_loader, device)
+            history.append({**row, "val_loss": val_loss})
+            if val_loss < best_val:
+                best_val = val_loss
+                torch.save({"model": raw_model.state_dict(), "config": asdict(raw_model.config),
+                            "step": step, "tokens_seen": tokens_seen, "val_loss": val_loss},
+                           OUT_DIR / "best.pt")
+            save_checkpoint(raw_model, optimizer, train_loader, step, tokens_seen, best_val, history, data_id, settings)
+            print(f"validation loss: {val_loss:.6f} | checkpoint saved", flush=True)
+        if step == stop_after and tokens_seen < TRAIN_TOKENS:
+            return {"step": step, "tokens_seen": tokens_seen, "history": history}
+
+    full_val = estimate_loss(model, val_loader, device, len(val_loader.tokens) - 1)
+    sample = generate(raw_model, device)
+    (OUT_DIR / "sample.txt").write_text(sample + "\n", encoding="utf-8")
+    summary = {
+        "completed": True, "step": step, "train_tokens": tokens_seen,
+        "validation_tokens": len(val_loader.tokens) - 1,
+        "full_validation_loss": full_val, "validation_perplexity": math.exp(full_val),
+        "best_periodic_validation_loss": best_val, "history": history,
+        "seconds_in_this_session": time.perf_counter() - started,
+    }
+    (OUT_DIR / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    print(f"Completed {tokens_seen:,} training tokens | full validation loss {full_val:.6f}", flush=True)
+    print(sample, flush=True)
+    return summary
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Course GPT-2: 100M-token single-GPU experiment")
+    parser.add_argument("--resume", action="store_true", help="resume log_100M/last.pt")
+    run(resume=parser.parse_args().resume)

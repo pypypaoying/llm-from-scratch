@@ -52,6 +52,10 @@ data/*
 !data/.gitkeep
 !data/README.md
 
+# FineWeb token arrays and download cache for the 100M-token experiment
+/05_GPT-2/edu_fineweb100M/*.npy
+/05_GPT-2/edu_fineweb100M/cache/
+
 # ===== 系统 / 编辑器 =====
 .DS_Store
 Thumbs.db
