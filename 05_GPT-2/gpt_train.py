@@ -77,7 +77,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024 # max sequence length
-    vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+    vocab_size: int = 50304 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
@@ -182,6 +182,32 @@ class GPT(nn.Module):
 
         return model
 
+#学习率余弦衰减
+max_lr = 6e-4          # 最大学习率
+min_lr = max_lr * 0.1  # 最小学习率：6e-5
+warmup_steps = 10      # 前 10 次更新逐渐增大学习率
+max_steps = 50         # 总共更新 50 次
+
+def get_lr(step):
+    # 第一阶段：线性预热
+    if step < warmup_steps:
+        return max_lr * (step + 1) / warmup_steps
+
+    # 超过调度范围后，保持最小学习率
+    if step > max_steps:
+        return min_lr
+
+    # 第二阶段：余弦衰减
+    decay_ratio = (
+        (step - warmup_steps)
+        / (max_steps - warmup_steps)
+    )
+    assert 0 <= decay_ratio <= 1
+
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+
+    return min_lr + coeff * (max_lr - min_lr)
+
 # -----------------------------------------------------------------------------
 import tiktoken
 
@@ -239,8 +265,8 @@ model.to(device)
 model = torch.compile(model)
 
 # optimize!
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(20):
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4 , betas = (0.9, 0.95) )
+for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -248,12 +274,18 @@ for i in range(20):
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # 本次更新使用的学习率
+    lr = get_lr(step)
+    # 将学习率写入优化器的所有参数组
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
     optimizer.step()
     torch.cuda.synchronize() # wait for the GPU to finish work
     t1 = time.time()
     dt = (t1 - t0)*1000 # time difference in miliseconds
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+    print(f"step {step}, loss: {loss.item()}, lr: {lr:.6f}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}, norm: {norm:.2f}")
 
 import sys; sys.exit(0)
 
